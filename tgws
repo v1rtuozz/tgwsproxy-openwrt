@@ -1,0 +1,167 @@
+#!/bin/sh
+# TG WS Proxy - управляющий скрипт
+
+CONF="/etc/tgwsproxy.conf"
+INIT="/etc/init.d/tgwsproxy"
+PROXY_BIN="/usr/bin/tg-ws-proxy"
+
+load_config() {
+    [ -f "$CONF" ] && . "$CONF"
+    HOST="${HOST:-0.0.0.0}"
+    PORT="${PORT:-1443}"
+    SECRET="${SECRET:-}"
+    BUFFER_SIZE="${BUFFER_SIZE:-256}"
+    POOL_SIZE="${POOL_SIZE:-4}"
+    ENABLED="${ENABLED:-0}"
+}
+
+save_config() {
+    cat > "$CONF" <<EOF
+# TG WS Proxy configuration
+HOST="$HOST"
+PORT="$PORT"
+SECRET="$SECRET"
+BUFFER_SIZE="$BUFFER_SIZE"
+POOL_SIZE="$POOL_SIZE"
+ENABLED="$ENABLED"
+EOF
+}
+
+status() {
+    if pgrep -f "$PROXY_BIN" >/dev/null 2>&1; then
+        echo "Прокси запущен (PID: $(pgrep -f "$PROXY_BIN" | tr '\n' ' '))"
+    else
+        echo "Прокси не запущен"
+    fi
+    echo "Автозапуск: $( [ "$ENABLED" = "1" ] && echo "включён" || echo "отключён" )"
+    echo "Слушает: $HOST:$PORT"
+    [ -n "$SECRET" ] && echo "Секрет: $SECRET" || echo "Секрет: (автогенерация)"
+}
+
+start_proxy() {
+    if pgrep -f "$PROXY_BIN" >/dev/null; then
+        echo "Прокси уже запущен"
+        return
+    fi
+    load_config
+    if [ -z "$SECRET" ]; then
+        SECRET=$(dd if=/dev/urandom bs=16 count=1 2>/dev/null | xxd -p -c 32)
+        save_config
+    fi
+    args="--host $HOST --port $PORT --buf-kb $BUFFER_SIZE --pool-size $POOL_SIZE"
+    [ -n "$SECRET" ] && args="$args --secret $SECRET"
+    if [ -f "/etc/tgwsproxy.dc" ]; then
+        while read dc ip; do
+            args="$args --dc-ip $dc:$ip"
+        done < /etc/tgwsproxy.dc
+    fi
+    mkdir -p /var/log/tg-ws-proxy
+    $PROXY_BIN $args >> /var/log/tg-ws-proxy/proxy.log 2>&1 &
+    echo "Прокси запущен (PID: $!)"
+}
+
+stop_proxy() {
+    pkill -f "$PROXY_BIN" 2>/dev/null && echo "Прокси остановлен" || echo "Прокси не был запущен"
+}
+
+enable_autostart() {
+    $INIT enable
+    echo "Автозапуск включён"
+    ENABLED=1
+    save_config
+}
+
+disable_autostart() {
+    $INIT disable
+    echo "Автозапуск отключён"
+    ENABLED=0
+    save_config
+}
+
+edit_config() {
+    echo "=== Настройка прокси ==="
+    load_config
+    read -p "Хост (по умолчанию $HOST): " new_host
+    [ -n "$new_host" ] && HOST="$new_host"
+    read -p "Порт (по умолчанию $PORT): " new_port
+    [ -n "$new_port" ] && PORT="$new_port"
+    read -p "Секрет (оставьте пустым для автогенерации): " new_secret
+    [ -n "$new_secret" ] && SECRET="$new_secret"
+    read -p "Буфер (KB, по умолчанию $BUFFER_SIZE): " new_buf
+    [ -n "$new_buf" ] && BUFFER_SIZE="$new_buf"
+    read -p "Размер пула (по умолчанию $POOL_SIZE): " new_pool
+    [ -n "$new_pool" ] && POOL_SIZE="$new_pool"
+    save_config
+    echo "Конфигурация сохранена. Перезапустите прокси для применения."
+}
+
+edit_dc() {
+    echo "=== Редактирование DC-перенаправлений ==="
+    echo "Формат: DC IP (например, 2 149.154.167.220)"
+    echo "Введите пары через пробел, пустая строка для завершения."
+    > /tmp/tgwsproxy.dc.tmp
+    while true; do
+        read -p "DC IP: " dc ip
+        [ -z "$dc" ] && break
+        echo "$dc $ip" >> /tmp/tgwsproxy.dc.tmp
+    done
+    if [ -s /tmp/tgwsproxy.dc.tmp ]; then
+        mv /tmp/tgwsproxy.dc.tmp /etc/tgwsproxy.dc
+        echo "DC-конфигурация обновлена."
+    else
+        rm -f /tmp/tgwsproxy.dc.tmp
+        echo "Ничего не изменено."
+    fi
+}
+
+show_log() {
+    less /var/log/tg-ws-proxy/proxy.log 2>/dev/null || echo "Лог-файл не найден"
+}
+
+menu() {
+    while true; do
+        clear
+        echo "===== TG WS Proxy ====="
+        status
+        echo ""
+        echo "1) Запустить прокси"
+        echo "2) Остановить прокси"
+        echo "3) Включить автозапуск"
+        echo "4) Отключить автозапуск"
+        echo "5) Настроить параметры"
+        echo "6) Настроить DC-перенаправления"
+        echo "7) Показать лог"
+        echo "8) Выход"
+        read -p "Выберите действие: " choice
+        case "$choice" in
+            1) start_proxy ;;
+            2) stop_proxy ;;
+            3) enable_autostart ;;
+            4) disable_autostart ;;
+            5) edit_config ;;
+            6) edit_dc ;;
+            7) show_log ;;
+            8) break ;;
+            *) echo "Неверный выбор" ;;
+        esac
+        echo "Нажмите Enter для продолжения..."
+        read dummy
+    done
+}
+
+if [ $# -eq 0 ]; then
+    menu
+else
+    case "$1" in
+        start) start_proxy ;;
+        stop) stop_proxy ;;
+        restart) stop_proxy; start_proxy ;;
+        status) status ;;
+        enable) enable_autostart ;;
+        disable) disable_autostart ;;
+        config) edit_config ;;
+        dc) edit_dc ;;
+        log) show_log ;;
+        *) echo "Использование: tgws {start|stop|restart|status|enable|disable|config|dc|log}" ;;
+    esac
+fi
