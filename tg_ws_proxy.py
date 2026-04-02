@@ -2,11 +2,12 @@
 # TG WS Proxy - WebSocket MTProto прокси для Telegram
 
 import os
+import time
 import sys
+import asyncio
 import ssl
 import json
 import struct
-import asyncio
 import hashlib
 import argparse
 import logging
