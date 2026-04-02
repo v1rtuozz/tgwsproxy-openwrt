@@ -3,7 +3,7 @@
 [![OpenWRT](https://img.shields.io/badge/OpenWRT-23.05+-blue)](https://openwrt.org)
 [![Telegram](https://img.shields.io/badge/Telegram-MTProto-blue)](https://telegram.org)
 
-**TG WS Proxy** — лёгкий и быстрый MTProto-прокси для Telegram с поддержкой WebSocket (WSS), оптимизированный для роутеров на OpenWRT.
+**TG WS Proxy** — Локальный MTProto-прокси для Telegram Desktop, который ускоряет работу Telegram, перенаправляя трафик через WebSocket-соединения. Данные передаются в том же зашифрованном виде, а для работы не нужны сторонние сервера. Оптимизированный под роутеры с OpenWRT
 
 ---
 
