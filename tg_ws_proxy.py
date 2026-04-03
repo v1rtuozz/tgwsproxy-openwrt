@@ -1,45 +1,21 @@
 #!/usr/bin/env python3
-# TG WS Proxy - WebSocket MTProto прокси для Telegram
-
-import os
 import time
 import sys
 import asyncio
-import ssl
+import logging
 import json
+import os
+import ssl
 import struct
 import hashlib
 import argparse
-import logging
-import logging.handlers
 import socket as _socket
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-@dataclass
-class ProxyConfig:
-    port: int = 1443
-    host: str = '0.0.0.0'
-    secret: str = field(default_factory=lambda: os.urandom(16).hex())
-    dc_redirects: Dict[int, str] = field(default_factory=lambda: {2: '149.154.167.220', 4: '149.154.167.220'})
-    dc_overrides: Dict[int, int] = field(default_factory=lambda: {203: 2})
-    buffer_size: int = 256 * 1024
-    pool_size: int = 4
-
-proxy_config = ProxyConfig()
-log = logging.getLogger('tg-mtproto-proxy')
-
-DC_DEFAULT_IPS: Dict[int, str] = {
-    1: '149.154.175.50',
-    2: '149.154.167.51',
-    3: '149.154.175.100',
-    4: '149.154.167.91',
-    5: '149.154.171.5',
-    203: '91.105.192.100'
-}
-
+# ---------- Constants ----------
 HANDSHAKE_LEN = 64
 SKIP_LEN = 8
 PREKEY_LEN = 32
@@ -64,8 +40,6 @@ RESERVED_CONTINUE = b'\x00\x00\x00\x00'
 
 DC_FAIL_COOLDOWN = 30.0
 WS_FAIL_TIMEOUT = 2.0
-ws_blacklist: Set[Tuple[int, bool]] = set()
-dc_fail_until: Dict[Tuple[int, bool], float] = {}
 
 _st_BB = struct.Struct('>BB')
 _st_BBH = struct.Struct('>BBH')
@@ -76,13 +50,36 @@ _st_BBQ4s = struct.Struct('>BBQ4s')
 _st_H = struct.Struct('>H')
 _st_Q = struct.Struct('>Q')
 _st_I_le = struct.Struct('<I')
-
 ZERO_64 = b'\x00' * 64
 
 _ssl_ctx = ssl.create_default_context()
 _ssl_ctx.check_hostname = False
 _ssl_ctx.verify_mode = ssl.CERT_NONE
 
+DC_DEFAULT_IPS: Dict[int, str] = {
+    1: '149.154.175.50',
+    2: '149.154.167.51',
+    3: '149.154.175.100',
+    4: '149.154.167.91',
+    5: '149.154.171.5',
+    203: '91.105.192.100'
+}
+
+# ---------- ProxyConfig ----------
+@dataclass
+class ProxyConfig:
+    port: int = 1443
+    host: str = '0.0.0.0'
+    secret: str = field(default_factory=lambda: os.urandom(16).hex())
+    dc_redirects: Dict[int, str] = field(default_factory=dict)
+    dc_overrides: Dict[int, int] = field(default_factory=lambda: {203: 2})
+    buffer_size: int = 256 * 1024
+    pool_size: int = 4
+
+proxy_config = ProxyConfig()
+log = logging.getLogger('tg-mtproto-proxy')
+
+# ---------- Helper functions ----------
 def _set_sock_opts(transport):
     sock = transport.get_extra_info('socket')
     if sock is None:
@@ -116,6 +113,14 @@ def get_link_host(host: str) -> Optional[str]:
     else:
         return host
 
+def _human_bytes(n: int) -> str:
+    for unit in ('B', 'KB', 'MB', 'GB'):
+        if abs(n) < 1024:
+            return f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}TB"
+
+# ---------- WebSocket exception ----------
 class WsHandshakeError(Exception):
     def __init__(self, status_code: int, status_line: str, headers: dict = None, location: str = None):
         self.status_code = status_code
@@ -128,6 +133,7 @@ class WsHandshakeError(Exception):
     def is_redirect(self) -> bool:
         return self.status_code in (301, 302, 303, 307, 308)
 
+# ---------- WebSocket client ----------
 class RawWebSocket:
     __slots__ = ('reader', 'writer', '_closed')
     OP_BINARY = 0x2
@@ -143,7 +149,9 @@ class RawWebSocket:
     @staticmethod
     async def connect(ip: str, domain: str, path: str = '/apiws', timeout: float = 10.0) -> 'RawWebSocket':
         import base64
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, 443, ssl=_ssl_ctx, server_hostname=domain), timeout=min(timeout, 10))
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, 443, ssl=_ssl_ctx, server_hostname=domain),
+            timeout=min(timeout, 10))
         _set_sock_opts(writer.transport)
         ws_key = base64.b64encode(os.urandom(16)).decode()
         req = (
@@ -160,7 +168,7 @@ class RawWebSocket:
         )
         writer.write(req.encode())
         await writer.drain()
-        response_lines: list[str] = []
+        response_lines = []
         try:
             while True:
                 line = await asyncio.wait_for(reader.readline(), timeout=timeout)
@@ -181,7 +189,7 @@ class RawWebSocket:
             status_code = 0
         if status_code == 101:
             return RawWebSocket(reader, writer)
-        headers: dict[str, str] = {}
+        headers = {}
         for hl in response_lines[1:]:
             if ':' in hl:
                 k, v = hl.split(':', 1)
@@ -276,13 +284,7 @@ class RawWebSocket:
         payload = await self.reader.readexactly(length)
         return opcode, payload
 
-def _human_bytes(n: int) -> str:
-    for unit in ('B', 'KB', 'MB', 'GB'):
-        if abs(n) < 1024:
-            return f"{n:.1f}{unit}"
-        n /= 1024
-    return f"{n:.1f}TB"
-
+# ---------- Handshake helpers ----------
 def _try_handshake(handshake: bytes, secret: bytes) -> Optional[Tuple[int, bool, bytes, bytes]]:
     dec_prekey_and_iv = handshake[SKIP_LEN:SKIP_LEN + PREKEY_LEN + IV_LEN]
     dec_prekey = dec_prekey_and_iv[:PREKEY_LEN]
@@ -407,6 +409,7 @@ def _ws_domains(dc: int, is_media) -> List[str]:
         return [f'kws{dc}-1.web.telegram.org', f'kws{dc}.web.telegram.org']
     return [f'kws{dc}.web.telegram.org', f'kws{dc}-1.web.telegram.org']
 
+# ---------- Stats ----------
 class Stats:
     def __init__(self):
         self.connections_total = 0
@@ -429,6 +432,10 @@ class Stats:
                 f"up={_human_bytes(self.bytes_up)} down={_human_bytes(self.bytes_down)}")
 
 _stats = Stats()
+
+# ---------- WebSocket pool ----------
+ws_blacklist: Set[Tuple[int, bool]] = set()
+dc_fail_until: Dict[Tuple[int, bool], float] = {}
 
 class _WsPool:
     WS_POOL_MAX_AGE = 120.0
@@ -513,6 +520,7 @@ class _WsPool:
 
 _ws_pool = _WsPool()
 
+# ---------- Data bridging ----------
 async def _bridge_ws_reencrypt(reader, writer, ws: RawWebSocket, label,
                                dc=None, is_media=False,
                                clt_decryptor=None, clt_encryptor=None,
@@ -670,6 +678,7 @@ async def _tcp_fallback(reader, writer, dst, port, relay_init, label,
 def _fallback_ip(dc: int) -> Optional[str]:
     return DC_DEFAULT_IPS.get(dc)
 
+# ---------- Client handler ----------
 async def _handle_client(reader, writer, secret: bytes):
     _stats.connections_total += 1
     _stats.connections_active += 1
@@ -827,6 +836,7 @@ async def _handle_client(reader, writer, secret: bytes):
         except BaseException:
             pass
 
+# ---------- Server ----------
 _server_instance = None
 _server_stop_event = None
 
@@ -1003,3 +1013,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+EOF
