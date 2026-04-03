@@ -51,9 +51,12 @@ start_proxy() {
     args="--host $HOST --port $PORT --buf-kb $BUFFER_SIZE --pool-size $POOL_SIZE"
     [ -n "$SECRET" ] && args="$args --secret $SECRET"
     if [ -f "/etc/tgwsproxy.dc" ]; then
-        while read dc ip; do
+    while read dc ip; do
+        # Пропускать пустые строки и строки без двух полей
+        if [ -n "$dc" ] && [ -n "$ip" ]; then
             args="$args --dc-ip $dc:$ip"
-        done < /etc/tgwsproxy.dc
+        fi
+    done < /etc/tgwsproxy.dc
     fi
     mkdir -p /var/log/tg-ws-proxy
     $PROXY_BIN $args >> /var/log/tg-ws-proxy/proxy.log 2>&1 &
